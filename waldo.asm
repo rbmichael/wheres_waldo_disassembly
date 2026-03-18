@@ -1,5 +1,60 @@
 ; Where's Waldo NES ROM Disassembly
 ; Code base address: $8000
+;
+; ── Waldo spawn RNG pipeline (subway / "find" maps) ─────────────────────────
+; Every time the player enters a "find Waldo" map, the game runs a deterministic
+; RNG pipeline to choose Waldo's (X, Y) position.  The pipeline is spread across
+; several routines, all driven by the three-byte RNG state at $0200-$0202 and
+; the NMI call counter at $0002.  Stages in order:
+;
+;   PRE_FRAMES  : rng_e3a8 ticks fire during countdown screen (one per NMI).
+;                 The exact number depends on how many frames pass before the
+;                 map-entry input is detected.
+;
+;   bank3_ee80  ($EE80) : vertical-third selector.
+;                 Calls rng_e4bf until result is 0/1/2; stores in $4A.
+;                 Also builds $6780 scene-attribute table for F30F.
+;                 1 NMI fires here (interrupts at $EF95 or $EF98).
+;
+;   bank3_efbe  ($EFBE) : entity pool fill.
+;                 Fills $6900[0..$53-1] with 53 unique values by calling
+;                 rng_e4bf repeatedly.  ~9 NMIs fire here (one per frame),
+;                 each calling rng_e3a8 + INC $02 before resuming.
+;                 The exact rngState after each NMI depends on which
+;                 instruction inside rng_e4bf was interrupted (split-point).
+;
+;   bank3_eff6  ($EFF6) : entity variant slot selector.
+;                 Calls rng_e4bf; AND #$0F; accepts if 0 < result <= $54.
+;                 Advances $4B/$4C to the chosen variant record (6 bytes).
+;
+;   bank3_f01f  ($F01F) : Y-position generator.
+;                 rng_e4bf AND #$0F + $4F; validates against band max $50.
+;
+;   bank3_f039  ($F039) : X-position generator.
+;                 rng_e4bf AND #$3F; validates 2 <= X < $F508[$0600].
+;                 Calls F26A (tile + column check) after each candidate.
+;
+;   bank3_f26a  ($F26A) : tile and column placement validator.
+;                 Reads $63C0 tilemap and $6780/$6800 scene-attribute tables.
+;                 Returns carry=0/$7185=0 for a valid position.
+;
+; Key RAM locations used by the pipeline:
+;   $0002 (_var_counter)     NMI call counter (entropy for rng_e4bf)
+;   $001A/$1B                Multi-purpose 16-bit pointer (pool count, tilemap ptr)
+;   $0022/$23                Secondary pointer / RNG bounds ($63C0 base, Y raw)
+;   $004A                    Chosen vertical third (0/1/2)
+;   $004B/$4C                Entity data pointer (into $A800 bank)
+;   $004D                    Current entity slot's vertical third
+;   $004F/$50                Y-band bounds (min/max)
+;   $0053                    Pool size (53 for subway scene)
+;   $0054                    Entity count upper-bound
+;   $0200-$0202              Three-byte RNG state (state0, state1, state2)
+;   $6780-$67FF              Scene-attribute table (column blocking flags)
+;   $6800-$687F              Column attribute data (per-column sprite attrs)
+;   $6900-$6934              Entity pool (53 unique slot indices)
+;   $63C0-$65FF              Tilemap snapshot (64 cols × 9 rows)
+;   $718B/$718C              Final WaldoX / WaldoY spawn coordinates
+; ─────────────────────────────────────────────────────────────────────────────
 
 .setcpu "6502x"
 .segment "HEADER"
@@ -37,16 +92,38 @@ PPU_MASK = $2001
 PPU_SCROLL = $2005
 PPU_STATUS = $2002
 
+; $02  NMI call counter: incremented every NMI (at $E374) AND once per NMI that
+;       fires during the EFBE pool-fill loop ($EFC2-$EFE0).  Used as entropy
+;       input to rng_e4bf ($E4BF) via EOR $02 in the computation.
 _var_counter = $0002
 _var_joypad1 = $0006
+; $1A/$1B  General-purpose 16-bit pointer, reused across many routines.
+;   In rng_e3a8 ($E3A8): low/high byte of "pntr_1a1b" entropy input.
+;   In EFBE pool-fill ($EFC2): $1A = current pool fill count (0..$53).
+;   In F26A tile-check: $1A/$1B point into the $63C0 tilemap.
 _var_pntr_1a1b_lowByte = $001a
 _var_pntr_1a1b_highByte = $001b
+; $22/$23  Secondary pointer / RNG bounds.
+;   In rng_e4bf ($E4BF): $22 (low) and $23 (high) are subtracted from the
+;   intermediate RNG value, providing per-scene entropy anchoring.
+;   Initialised to $C0/$63 (pointing at tilemap base $63C0) at $EF03/$EF05
+;   and stepped by +$0140 per row during the $6780 scene-attr table build.
+;   In F01F: $22 holds the Y-position raw RNG result; $23 holds Y row index.
 _var_pntr_2223_lowByte = $0022
 _var_pntr_2223_highByte = $0023
+; $4A  Waldo's vertical third (0=top, 1=middle, 2=bottom), chosen at $EE80.
+;      Compared against $4D at $EFEF; Waldo placement only proceeds when equal.
 _var_waldoTopMidBtm = $004a
+; $4B/$4C  Pointer into entity data bank at $A800.
+;   Each entity record is 6 bytes: [count, pool_size, width, height, attr, ptr_lo/hi].
+;   Stepped by +6 each time a new entity variant is tried ($F003/$F075/$F093).
 _var_pntr_4b4c_lowByte = $004b
 _var_pntr_4b4c_highByte = $004c
 
+; Three-byte RNG state, updated every call to rng_e4bf ($E4BF).
+; rng_e3a8 ($E3A8) also reads/writes state0 and state1 for per-frame entropy.
+; Carry out of state0 after rng_e4bf's final SBC encodes the "spawn-valid" flag
+; used by $EFF6 and $F01F to decide whether to accept or retry.
 _var_rngState0 = $0200
 _var_rngState1 = $0201
 _var_rngState2 = $0202
@@ -11600,6 +11677,21 @@ _label_bank3_e1dc:
 .byte $50, $46
 
 NMI:
+; NMI handler entry point ($E237).  Fires once per PPU frame (~29780.5 CPU cycles).
+; Saves A/X/Y to stack, then dispatches based on game-state flags:
+;   $30 != 0  -> MMC3 bank-switch update ($E241)
+;   $05 = 0   -> skip game logic, jump to $E263 timer+PPU path
+;   $05 = $10 -> clear $05, jump $E374 via $E296
+;   $05 = $2F -> launchpad-complete path
+;   $05 = $08 -> sub-routine $E2BB
+;   $05 = $28 -> OAM DMA + PPU update, clear $05
+;   $05 bit7  -> OAM DMA + $92F2, clear $05
+;   $05 = $20 -> OAM DMA ($4014), clear $05, fall through to $E374
+; All paths eventually reach $E374 (common NMI tail) or return early via RTI.
+; CRITICAL for RNG prediction: during the entity-placement phase ($05 = $20),
+; EVERY NMI that fires increments $02 (_var_counter) at $E374 and calls
+; rng_e3a8 ($E38D), mutating the RNG state once per frame regardless of
+; what the main-loop code is doing.
  sei                    ; $E237 78
  pha                    ; $E238 48
  txa                    ; $E239 8A
@@ -11801,6 +11893,18 @@ _label_bank3_e35a:
  sta $05                ; $E372 85 05
 
 _label_bank3_e374:
+; Common NMI tail ($E374-$E3A7): runs every frame when $05 != 0.
+; Execution order and approximate cycle costs (relevant for RNG timing):
+;   INC $02          (5)  -- increment NMI call counter (_var_counter)
+;   PPU register restore: PPU_CTRL, PPU_SCROLL x2, PPU_MASK  (~28 cy)
+;   JSR $E516        (6 + ~269 = 275)  -- joypad poll (fixed cost, 8 iterations)
+;   JSR $E3A8        (6 + 23  =  29)  -- rng_e3a8 entropy tick (fixed cost)
+;   JSR $E3C0        (6 + var)        -- timer display update (variable)
+;   JSR $FA07        (6 + var)        -- sound/music update (variable)
+;   MMC3 CHR bank writes, PLA x3, RTI
+; Total handler cost from NMI fire to RTI depends on the game-state variables
+; examined by $E3C0 and $FA07; measured at ~3727-5002 cycles depending on
+; the pool-fill level ($1A) at the time of the NMI (see EFBE loop at $EFC2).
  inc z:_var_counter                ; $E374 E6 02
  lda $00                ; $E376 A5 00
  sta a:PPU_CTRL              ; $E378 8D 00 20
@@ -11825,13 +11929,20 @@ _label_bank3_e374:
  pla                    ; $E3A6 68
  rti                    ; $E3A7 40
 
-; RNG - entropy, every frame
-; state1 xor 1b
-; state1 shift left (bit 7 -> carry)
-; state1 = state0 rotate-left (with carry)
-; state0++
-; state0 = state1 xor 1a
-; state1--
+; rng_e3a8 ($E3A8) -- per-frame entropy RNG tick.
+; Called once per NMI from $E38D (and directly from other sites).
+; Inputs:  rngState0 ($0200), rngState1 ($0201), $1A (pntr_1a1b_low), $1B (pntr_1a1b_high)
+; Effect (19 cycles body, 23 including JSR overhead):
+;   tmp    = (rngState1 XOR $1B) << 1          [ASL, sets carry = old bit7]
+;   rngState0 = ROL(rngState0, carry)           [ROL -- rotate left through carry]
+;   rngState1 = tmp                             [STA]
+;   rngState0 = rngState0 + 1                   [INC -- does NOT affect carry]
+;   rngState0 = rngState0 XOR $1A              [EOR + STA -- overwrites INC result]
+;   rngState1 = rngState1 - 1                   [DEC]
+; Returns carry = bit7 of rngState0 BEFORE the ROL (i.e., old carry after ASL).
+; Note: $1A and $1B used here are the same zero-page locations reused as the
+; low/high bytes of the general pointer; their values during the NMI tick are
+; whatever the main loop left in those bytes (pool count during EFBE, etc.).
  lda a:_var_rngState1              ; $E3A8 AD 01 02
  eor z:_var_pntr_1a1b_highByte                ; $E3AB 45 1B
  asl A          ; $E3AD 0A
@@ -12004,6 +12115,42 @@ _label_bank3_e484:
  lda $44                ; $E4BC A5 44
  rti                    ; $E4BE 40
 
+; rng_e4bf ($E4BF) -- primary entity-placement RNG.
+; Called from EFBE pool-fill ($EFC2), EFF6 entity-slot selector, F01F Y/X pickers,
+; EE80 vertical-third selector, and many other sites.
+; Inputs: rngState0 ($0200), rngState1 ($0201), rngState2 ($0202),
+;         $1A (pntr_1a1b_low), $1B (pntr_1a1b_high),
+;         $22 (pntr_2223_low),  $23 (pntr_2223_high),
+;         $02 (_var_counter, NMI call count).
+; Body is exactly 75 cycles; JSR+RTS overhead = 12; total per call = 81 cycles.
+; Instruction-level cycle offsets from body start (used for NMI split-point analysis):
+;   $E4BF +0:  INC rngState2         (6)
+;   $E4C2 +6:  ROR rngState1         (6)
+;   $E4C5 +12: ROR rngState0         (6)
+;   $E4C8 +18: LDA rngState1         (4)
+;   $E4CB +22: SEC                   (2)
+;   $E4CC +24: SBC $22               (3)
+;   $E4CE +27: CLC                   (2)
+;   $E4CF +29: ADC $1B               (3)
+;   $E4D1 +32: EOR $02               (3)  <-- NMI counter injection point
+;   $E4D3 +35: EOR rngState0         (4)
+;   $E4D6 +39: STA rngState1         (4)
+;   $E4D9 +43: LDA rngState0         (4)
+;   $E4DC +47: CLC                   (2)
+;   $E4DD +49: ADC $1A               (3)
+;   $E4DF +52: ADC rngState2         (4)
+;   $E4E2 +56: EOR rngState1         (4)
+;   $E4E5 +60: SEC                   (2)
+;   $E4E6 +62: SBC $23               (3)
+;   $E4E8 +65: STA rngState0         (4)  <-- result in A and rngState0
+;   $E4EB +69: RTS                   (6)
+; Effect:
+;   rngState2 += 1
+;   {rngState1,rngState0} = ROR16({rngState1,rngState0})
+;   rngState1 = (rngState1 - $22 + $1B) XOR $02 XOR rngState0
+;   rngState0 = (rngState0 + $1A + rngState2) XOR rngState1 - $23
+; Returns A = new rngState0; carry = borrow out of final SBC $23
+;   (carry=0 => valid placement candidate in EFBE/EFF6/F01F loops).
 ; RNG - Linear Feedback Shift Register with arithmetic mixing
 ; additional RNG (entropy) at $e3a8
 ; State2++
@@ -12063,7 +12210,9 @@ _label_bank3_e511:
  bne _label_bank3_e511		; $E513 D0 FC
  rts                    ; $E515 60
 
-; input polling
+; joypad_poll ($E516) -- reads both joypads into $06 (joypad1) and $07 (joypad2).
+; Fixed cost: 16 setup + 8*(31 loop body) - 1 (last BPL not-taken) + 6 RTS = ~269 cycles.
+; Called from $E38A in the common NMI tail every frame.
  lda #$01               ; $E516 A9 01
  sta a:JOYPAD1              ; $E518 8D 16 40
  lda #$00               ; $E51B A9 00
@@ -12967,6 +13116,8 @@ _label_bank3_ee5e:
  sta z:_var_pntr_1a1b_highByte                ; $EE72 85 1B
  ldy #$00               ; $EE74 A0 00
 
+; map tile data (bitmasks?) fetch to $6800-$687F
+; train station data from $a60f
 _label_bank3_ee76:
  lda ($1A),Y            ; $EE76 B1 1A
  sta $6800,Y            ; $EE78 99 00 68
@@ -12974,10 +13125,25 @@ _label_bank3_ee76:
  cpy #$80               ; $EE7C C0 80
  bne _label_bank3_ee76		; $EE7E D0 F6
 
+; bank3_ee80 ($EE80) -- vertical-third selector.  Pipeline stage 1 of Waldo placement.
+; Runs ~8 frames after the player presses the map-entry button (on the countdown screen).
+; Selects which vertical third (top/mid/bottom) Waldo will spawn in by calling
+; rng_e4bf until it returns 0, 1, or 2 (retry on 3).  Result stored in $4A.
+; Derives Y-band bounds ($4F = min-Y, $50 = max-Y) from the scene data table at ($48).
+; Sets $4B/$4C pointer to one of three entity-data sub-tables in bank $A8xx.
+; Also builds the $6780 scene-attribute table (64-entry column-attribute array)
+; by scanning the tilemap at $63C0 for the selected Y-band and OR-ing attribute
+; bits from $F30F into $6780,X for each occupied column.
+; One NMI fires during this routine (observed in all captured delays); the NMI
+; interrupts at $EF95 or $EF98 and fires rng_e3a8 + INC $02 before resuming.
 ; waldo generation related
 ; later code ($eff1) needs $4a = $4d to generate waldo
 ; get RNG 0, 1, or 2. Store in $4A. Determines which vertical third of the screen to spawn in.
-; updates pointer $4B-$4C with address from $A000,Y
+; updates pointer $4B-$4C with address from ($48) = $A000,Y
+; happens 8 frames after button press (countdown screen)
+; $4b-$4c = ($48),y(8-9,10-11,12-13) one of: $acb1, $aeaf, $b0f0 (different data for the 3 vertical sections)
+; $50 = ($48),y(6-7) = 8, 16, else 24 (spawn thirds max-y)
+; $4F = 0, 8, 16 (spawn thirds min-y)
 _label_bank3_ee80:
  jsr $E4BF              ; $EE80 20 BF E4
  and #$03               ; $EE83 29 03
@@ -13035,6 +13201,13 @@ _label_bank3_ee80:
  ldx #$02               ; $EEE6 A2 02
  jmp $EEEB              ; $EEE8 4C EB EE
 
+; bank3_eeeb ($EEEB) -- entity vertical-third assignment.
+; Called from EEB6, EED0, EEE8 with X = entity slot index (0, 1, or 2).
+; Stores X into $4D ("current vertical third" for EFED comparison vs $4A).
+; Computes $1A/$1B = base tilemap address for this band:
+;   $1A = $F3EA[X] + ($48),2 + $C0   (low byte)
+;   $1B = $F408[X] + ($48),3 + $63   (high byte)
+; Sets $22/$23 = $63C0 (tilemap base pointer for EF7C scene-attr scan).
 ; hard-coded $22-$23 pointer update = $63C0
 ; updates $4D to 0, 1, or 2 (waldo generation related - top/mid/btm)
  stx $4D                ; $EEEB 86 4D
@@ -13130,6 +13303,16 @@ _label_bank3_ef78:
  lda #$00               ; $EF78 A9 00
  sta $27                ; $EF7A 85 27
 
+; Scene-attribute table build loop ($EF7C-$EFAA).
+; Scans the tilemap at $63C0 (via pointer $22/$23 stepped by +1 per column)
+; for all columns in the selected Y-band [$4F, $50).
+; For each row/column, calls F30F to compute:
+;   $7182 = column attribute mask, $7184 = combined index into $6780.
+; If the tilemap byte at ($22),Y is non-zero (tile occupied), OR $FF & $7182
+; into $6780[$7184], marking that column as blocked for Waldo placement.
+; Effectively writes $7182 into $6780[$7184] for every occupied tile column.
+; On completion: $6780 has a non-zero entry at each column+row combination
+; that contains an existing sprite, used by F26A to check for conflicts.
 _label_bank3_ef7c:
  ldx $27                ; $EF7C A6 27
  lda $26                ; $EF7E A5 26
@@ -13159,6 +13342,11 @@ _label_bank3_ef9e:
  dec $28                ; $EFA8 C6 28
  bne _label_bank3_ef78		; $EFAA D0 CC
  ldy #$00               ; $EFAC A0 00
+; Load entity-data header from ($4B),Y:
+;   Y=0: byte 0 = $54 (entity count upper-bound / RNG ceiling in EFF6)
+;   Y=1: byte 1 = $53 (pool size = number of unique slots to fill, max 53)
+;   Y=14 ($0E via ($48)): $7186 = scene-attribute selector byte
+; These fields drive the EFBE pool-fill loop and subsequent placement loops.
  lda ($4B),Y            ; $EFAE B1 4B
  sta $54                ; $EFB0 85 54
  iny                    ; $EFB2 C8
@@ -13167,13 +13355,46 @@ _label_bank3_ef9e:
  ldy #$0E               ; $EFB7 A0 0E
  lda ($48),Y            ; $EFB9 B1 48
  sta $7186              ; $EFBB 8D 86 71
+; bank3_efbe ($EFBE) -- entity pool fill.  Pipeline stage 2 of Waldo placement.
+; Fills a deduplication buffer at $6900 with $53 unique values, each < $53,
+; by calling rng_e4bf repeatedly.  Rejects values >= $53 (carry=1 from SBC)
+; or values already in the buffer (duplicate check at $EFCB-$EFD5).
+; Accepted values are appended at $6900,$1A and $1A is incremented.
+; Loop terminates when $1A == $53 (pool full).
+; NMIs fire ~9 times during this loop (one per frame); each NMI:
+;   - increments $02 (_var_counter) at $E374
+;   - calls rng_e3a8 at $E38D, mutating rngState0/rngState1
+;   - records (e4bf_call_count, interrupted_PC, pool_size_$1A, $1B) for prediction
+; The interrupted PC within the rng_e4bf body (or the EFBE inter-call overhead)
+; determines the exact rngState after each NMI resumes.
+; NMI handler duration (fire-to-resume): varies with pool fill level $1A --
+;   $1A =  0-2  (pool nearly empty, 1st NMI):  ~4976-5002 cycles
+;   $1A = 3-33  (partially filled, 2nd NMI):   ~3811-3837 cycles
+;   $1A = 34-52 (mostly filled, NMI #3+):      ~3727-3753 cycles
+; $1A reset to 0 here; $53 = pool_size (loaded above).
  lda #$00               ; $EFBE A9 00
  sta z:_var_pntr_1a1b_lowByte                ; $EFC0 85 1A
 
+; EFBE pool-fill inner loop: get a unique value in [0, $53) and add to $6900.
+; rng_e4bf returns A = new rngState0; carry=0 means accepted (A < $53 via SBC).
+; If carry=1 (A >= $53): retry (branch back to $EFC2).
+; If carry=0: scan existing pool at $6900[0..$1A-1] for a duplicate.
+;   Duplicate found: retry from $EFC2.
+;   No duplicate:    store at $6900[$1A], INC $1A, loop until $1A == $53.
+; Post-loop: $4B/$4C advanced by +2 (skip count/pool-size header bytes).
+; NMI interrupt points during this loop:
+;   Body phase  ($E4BF-$E4EB): rng_e4bf mid-computation; RTI re-executes
+;               the interrupted instruction so rngState is deterministic.
+;   Overhead at $EFC5-$EFC7 (reject path, ~6 cy window)
+;   Overhead at $EFCB-$EFD5 (dup-scan loop, variable window)
+;   Overhead at $EFD7-$EFE0 (accept path, ~25 cy window)
+; The inter-call overhead windows at $EFC5/$EFCD/$EFD2 (overhead PCs) that
+; fire when $1A = 50-52 (pool nearly full) produce a ~4942-4977 cycle handler
+; instead of the normal ~3727 cycle handler (accept-path timing anomaly).
+_label_bank3_efc2:
 ; construct a randomly ordered list of numbers from zero to $53
 ; used in map generation for selecting what sprites get placed on the tiles?
 ; loop: get RNG until it's < $53, then y = 0x00
-_label_bank3_efc2:
  jsr $E4BF              ; $EFC2 20 BF E4
  cmp $53                ; $EFC5 C5 53
  bcs _label_bank3_efc2		; $EFC7 B0 F9
@@ -13182,9 +13403,9 @@ _label_bank3_efc2:
 ; loops through list of unique numbers, checking if current RNG is equal
 ; if so, gets new RNG and starts over
 ; once done, on to $EFD7
-; $1A = length of list at $6900
-; $6900 = list of unique RNG-generated numbers
-; $6800 = related data, something to do with generating what sprites get placed on map tiles?
+; $1A = current pool fill count (number of accepted unique values so far)
+; $6900 = deduplication buffer (unique RNG-generated slot indices)
+; $6800 = column-attribute data, pre-built at $EF7C; used by F26A tile-check
 _label_bank3_efcb:
  cpy z:_var_pntr_1a1b_lowByte                ; $EFCB C4 1A
  beq _label_bank3_efd7		; $EFCD F0 08
@@ -13193,7 +13414,8 @@ _label_bank3_efcb:
  iny                    ; $EFD4 C8
  bne _label_bank3_efcb		; $EFD5 D0 F4
 
-; loop: adds new unique number to the end of the list starting at $6900 until list is $53 bytes long
+; Accept path: append A to $6900[$1A], increment $1A (pool fill count).
+; If $1A == $53: pool is full; advance $4B/$4C by +2 (skip header bytes).
 _label_bank3_efd7:
  sta $6900,Y            ; $EFD7 99 00 69
  inc z:_var_pntr_1a1b_lowByte                ; $EFDA E6 1A
@@ -13207,23 +13429,40 @@ _label_bank3_efd7:
  bcc _label_bank3_efed		; $EFE9 90 02
  inc z:_var_pntr_4b4c_highByte                ; $EFEB E6 4C
 
-; if $4D (possibly 'current vertical third') == $4A ('third to spawn waldo in'), do waldo generation
+; Vertical-third gate: only proceed to Waldo placement if this entity slot's
+; vertical third ($4D, set by EEEB) matches the RNG-chosen third ($4A, set by EE80).
+; If $4D != $4A: skip to $F06A (non-Waldo entity processing path).
 _label_bank3_efed:
  lda $4D                ; $EFED A5 4D
  cmp z:_var_waldoTopMidBtm                ; $EFEF C5 4A
  beq _label_bank3_eff6		; $EFF1 F0 03
  jmp $F06A              ; $EFF3 4C 6A F0
 
+; bank3_eff6 ($EFF6) -- entity variant slot selector.  Pipeline stage 3.
+; Picks a slot offset (0 < result <= $54) for Waldo's variant within the
+; entity data sub-table:
+;   rng_e4bf, AND #$0F  -> candidate in [0, 15]
+;   retry if candidate == 0 (would leave width/height unset -- known bug)
+;   retry if candidate >= $54 (out of range for this entity table)
+;   store candidate in $1A
+; Then advance $4B/$4C by ($1A * 6) to point at the chosen variant record.
+; The chosen record (6 bytes at ($4B),Y) provides:
+;   Y=0: width  -> $718D (_var_waldoWidth)
+;   Y=1: height -> $718E (_var_waldoHeight)
+;   Y=4: attribute byte -> $6880,X (used in placement check)
+;   Y=5: sprite-attribute flag (bit7 set = use $7185 path in F26A)
+; One NMI may fire during EFF6 if timing aligns (captured for delay=20 only).
 ; gets RNG, reduces to 0x0F max, re-runs RNG if bigger than $54 (upper bound)
 ; stores in $1A (used to find where to pull data from)
 ; bug: if RNG AND 0x0F == 0, waldo width/height doesn't get set
 ; $A000,Y (8, A, C) = pointers to map-related data ($ACB1,$AEAF,$B00F), stored in $4B-$4C
 ; sequences of 6 bytes
 ; 1st byte stored in $54 (upper bound for data length)
-; 2nd byte ?
-; 3rd byte waldo width
-; 4th byte waldo height
-; 5th+6th byte = 16-bit pointer to more data (sequence of numbers)
+; 2nd byte = entity count (loaded into $53 by EFAF; here already consumed)
+; 3rd byte = width  (offset 0 in record, read at F014)
+; 4th byte = height (offset 1 in record, read at F01A)
+; 5th byte = attribute (offset 4 in record, stored in $6880,X at F08B)
+; 6th byte = sprite-attribute flag (offset 5: bit7 set triggers $7185 path in F26A)
 _label_bank3_eff6:
  jsr $E4BF              ; $EFF6 20 BF E4
  and #$0F               ; $EFF9 29 0F
@@ -13236,6 +13475,8 @@ _label_bank3_eff6:
 ; $4B = pointer to waldo properties, ordered: width, height; data table starts at $ACB3
 ; loop RNG ($1a) times: increases low byte of $4B-$4C pointer by 0x06 (incr $4C if overflow)
 _label_bank3_f003:
+; Advance $4B/$4C by +6 ($1A times) to reach the chosen variant record.
+; Each entity record is exactly 6 bytes wide; $1A was set by EFF6 [1..$54].
  lda z:_var_pntr_4b4c_lowByte                ; $F003 A5 4B
  clc                    ; $F005 18
  adc #$06               ; $F006 69 06
@@ -13243,7 +13484,9 @@ _label_bank3_f003:
  bcc _label_bank3_f00e		; $F00A 90 02
  inc z:_var_pntr_4b4c_highByte                ; $F00C E6 4C
 
-; waldo property width (a:_var_waldoWidth) and height (a:_var_waldoHeight) generation
+; Load width and height from the selected entity variant record at ($4B).
+; ($4B),0 = width  -> $718D (_var_waldoWidth)
+; ($4B),1 = height -> $718E (_var_waldoHeight)
 _label_bank3_f00e:
  dec z:_var_pntr_1a1b_lowByte                ; $F00E C6 1A
  bne _label_bank3_f003		; $F010 D0 F1
@@ -13254,33 +13497,43 @@ _label_bank3_f00e:
  lda ($4B),Y            ; $F01A B1 4B
  sta a:_var_waldoHeight              ; $F01C 8D 8E 71
 
-; waldo y generation (a:_var_waldoY)
-; routine e4bf = RNG
-; maximum of 15
-; checks if value + waldo height works
+; bank3_f01f ($F01F) -- Waldo Y-position generator.  Pipeline stage 4, part A.
+; Calls rng_e4bf; takes low 4 bits (0-15) as raw Y offset; adds $4F (band min-Y).
+; Stores raw offset in $23, absolute Y in $22 and _var_waldoY ($718C).
+; Validates: (Y + height) must be <= $50 (band max-Y) -- retry if over.
+; Equality with $50 is permitted (exact fit at band bottom edge).
+; NMIs may fire here; each increments $02 and calls rng_e3a8.
+; One NMI during F01F was observed for delay=20 (captured in EFF6 table as
+; it fires during the final rng_e4bf call of EFF6 / first call of F01F).
 _label_bank3_f01f:
  jsr $E4BF              ; $F01F 20 BF E4
  and #$0F               ; $F022 29 0F
- sta z:_var_pntr_2223_highByte                ; $F024 85 23
+ sta z:_var_pntr_2223_highByte                ; $F024 85 23  ; Y raw offset saved in $23
  clc                    ; $F026 18
  adc $4F                ; $F027 65 4F
- sta z:_var_pntr_2223_lowByte                ; $F029 85 22
+ sta z:_var_pntr_2223_lowByte                ; $F029 85 22  ; absolute Y in $22
  sta a:_var_waldoY              ; $F02B 8D 8C 71
  ldy #$01               ; $F02E A0 01
  clc                    ; $F030 18
- adc ($4B),Y            ; $F031 71 4B
- cmp $50                ; $F033 C5 50
- beq _label_bank3_f039		; $F035 F0 02
- bcs _label_bank3_f01f		; $F037 B0 E6
+ adc ($4B),Y            ; $F031 71 4B  ; Y + height
+ cmp $50                ; $F033 C5 50  ; compare to band max-Y
+ beq _label_bank3_f039		; $F035 F0 02  ; equal = fits exactly, accept
+ bcs _label_bank3_f01f		; $F037 B0 E6  ; greater = out of band, retry
 
-; waldo x generation (a:_var_waldoX)
-; routine e4bf = RNG
-; maximum of 63
-; checks if possible, if not, tries again
-;	needs to be:
-;		< $f508,x (x=$0600) (screen widths table for the 3 difficulty settings: 0x1E, 0x2E, 0x3E)
-;		> 0x01
-; func_f26a sets "done" ($7185 = 0x00, plus other (possibly sprite location?) checks)
+; bank3_f039 ($F039) -- Waldo X-position generator.  Pipeline stage 4, part B.
+; Calls rng_e4bf; takes low 6 bits (0-63) as X candidate.
+; Constraints (retry if violated):
+;   X >= 2                       (left margin)
+;   X < $F508[$0600]             ($0600 = scene index 0/1/2;
+;                                 table at $F508: widths $1E/$2E/$3E)
+; Accepted X stored in $24 and _var_waldoX ($718B).
+; Then calls F26A (tile/column validation).
+; After F26A:
+;   carry=1 -> tile occupied or column check failed -> retry Y (back to F01F)
+;   $7185 != 0 -> sprite-attribute conflict -> retry Y (back to F01F)
+;   carry=0, $7185=0 -> valid position; proceed
+; If $0600 == 0 (easiest difficulty): additionally set $7180 = $7186 and
+; decrement $7185 (sets it to $FF, a flag for F067).
 _label_bank3_f039:
  jsr $E4BF              ; $F039 20 BF E4
  and #$3F               ; $F03C 29 3F
@@ -13292,9 +13545,9 @@ _label_bank3_f039:
  sta $24                ; $F04A 85 24
  sta a:_var_waldoX              ; $F04C 8D 8B 71
  jsr $F26A              ; $F04F 20 6A F2
- bcs _label_bank3_f01f		; $F052 B0 CB
+ bcs _label_bank3_f01f		; $F052 B0 CB  ; F26A carry=1: tile blocked, retry Y
  lda $7185              ; $F054 AD 85 71
- bne _label_bank3_f01f		; $F057 D0 C6
+ bne _label_bank3_f01f		; $F057 D0 C6  ; $7185 != 0: column conflict, retry Y
  lda $0600              ; $F059 AD 00 06
  bne _label_bank3_f067		; $F05C D0 09
  lda $7186              ; $F05E AD 86 71
@@ -13626,6 +13879,57 @@ _label_bank3_f262:
  clc                    ; $F268 18
  rts                    ; $F269 60
 
+; bank3_f26a ($F26A) -- tile and column placement validator.  Pipeline stage 5.
+; Called from F04F with Waldo's (X=$24, Y=$22/$23) candidate position.
+; Checks two conditions in sequence:
+;
+; CONDITION 1 -- Tile check ($F26A-$F306, carry=0 on pass):
+;   Computes $1A/$1B = tilemap address for column $24, row $23:
+;     base $63C0 + row_offset($F3EA[row]) + col_offset($F408[row]) + $24
+;   For each of ($4B),1 rows (height):
+;     Reads ($4B),0 tile bytes (width) from tilemap at ($1A),Y.
+;     If ANY byte != 0: tile is occupied -> jump to carry=1 exit at $F30A.
+;     If ALL zero: passes; advance $1A by +$40 (next row), INC $22 (next row index).
+;   All rows clear -> tile check passes.
+;
+; CONDITION 2 -- Column attribute check ($F2AC-$F306, only if tile check passes):
+;   For each column X in [$24, $24+width):
+;     Calls F30F to load column-attribute mask for (row $22+4, col X) into $7182.
+;     Reads $6800[X] (column attribute byte built during EE80 scene scan).
+;     AND with $7182, right-shift until < 4 -> "reference value" stored in $7180.
+;     On ROW 0: $7185 = 0 if $7185 was already 0, else OR in reference.
+;     On ROW 1 (and subsequent): $7185 | reference must equal reference of row 0.
+;       Mismatch -> jump to carry=1 exit at $F307 (IMPORTANT: $7185 is set to
+;       the mis-matching value, so F039 retries on $7185 != 0 after return).
+;   All columns match -> column check passes, $7185 = 0, carry=0.
+;
+; When entity record byte ($4B),5 has bit7 set (sprite-attribute flag, $7185
+; path): F30F sets $7185 non-zero on row 0 if $6780[$7184] & $7182 != 0.
+; In that case row 1 uses a different $7182 mask (bit1=1 via F4C4 vs F484),
+; producing a deliberate mismatch -> carry=1 exit via $F307 with
+; $1A decremented by $40 (restored to row-0 base). This is the mechanism by
+; which the $7185/$6780 flag forces an unconditional carry=1 return,
+; causing F039 to retry the entire Y/X position.
+;
+; CARRY SEMANTICS (used by caller at $F052/$F1A2 etc.):
+;   carry=0, $7185=0 : fully valid position  -> proceed to placement
+;   carry=1           : blocked (tile or column mismatch) -> caller retries
+;   carry=0, $7185!=0: column attribute conflict         -> caller retries
+;
+; Memory layout referenced:
+;   $63C0-$65FF : 576-byte tilemap snapshot (64 columns x 9 rows), captured
+;                 at F01F entry; 0 = empty, non-zero = occupied tile.
+;   $6780-$67FF : 128-byte scene-attribute table (one byte per column-pair,
+;                 indexed by $7184 = F444[row] + F426[col_offset]); non-zero
+;                 entries indicate columns that block Waldo.  Built at EE80.
+;   $6800-$687F : 128-byte column-attribute data (one byte per column slot,
+;                 indexed directly by X=$24); also built at EE80.
+;   $7180       : reference attribute nibble (row 0 comparison baseline)
+;   $7182/$7183 : current attribute mask / inverse mask (from F30F)
+;   $7184       : combined row+column index into $6780 (from F30F)
+;   $7185       : sprite-attribute conflict flag; 0 = no conflict
+;   $7186       : scene attribute selector byte (loaded from ($48),14 at EFBB)
+;
 ; checks if Waldo spawn is OK
 ; base map data $63C0
 ; pointer $1A-$1B to map data, base + f3ea,x and f408,x (x=$23) + $24
@@ -13647,6 +13951,8 @@ _label_bank3_f262:
  inc z:_var_pntr_1a1b_highByte                ; $F287 E6 1B
 
 _label_bank3_f289:
+; Outer row loop: $1C = height (rows remaining), $22 = current row index.
+; Clear $7185 (column attribute conflict flag) at start of each F26A call.
  ldy #$01               ; $F289 A0 01
  lda ($4B),Y            ; $F28B B1 4B
  sta $1C                ; $F28D 85 1C
@@ -13654,17 +13960,21 @@ _label_bank3_f289:
  sta $7185              ; $F291 8D 85 71
 
 _label_bank3_f294:
+; Inner column loop: $1D = width (columns remaining).
  ldy #$00               ; $F294 A0 00
  lda ($4B),Y            ; $F296 B1 4B
  sta $1D                ; $F298 85 1D
 
-; gets map tile value and checks if ok to put Waldo there (i.e., = 0x00)
+; Tile scan: read tilemap bytes ($1A),0..width-1.  Any non-zero -> carry=1 exit.
 _label_bank3_f29a:
  lda ($1A),Y            ; $F29A B1 1A
- bne _label_bank3_f30a		; $F29C D0 6C
+ bne _label_bank3_f30a		; $F29C D0 6C  ; non-zero tile: blocked
  iny                    ; $F29E C8
  dec $1D                ; $F29F C6 1D
  bne _label_bank3_f29a		; $F2A1 D0 F7
+
+; All tiles in this row are clear.  Now check column attributes.
+; Push $24 (current X position), reload width into $1D.
  lda $24                ; $F2A3 A5 24
  pha                    ; $F2A5 48
  ldy #$00               ; $F2A6 A0 00
@@ -13672,96 +13982,138 @@ _label_bank3_f29a:
  sta $1D                ; $F2AA 85 1D
 
 _label_bank3_f2ac:
+; Column attribute check loop: for each column X in [X_base, X_base+width).
+; Calls F30F: sets $7182 (mask) and returns A = $6780[$7184] & $7182.
+; If A (masked scene-attr byte) == 0: no blocking attribute, row passes.
+; If A != 0: this column has a blocking attribute -> mismatch detected.
  lda z:_var_pntr_2223_lowByte                ; $F2AC A5 22
  clc                    ; $F2AE 18
- adc #$04               ; $F2AF 69 04
+ adc #$04               ; $F2AF 69 04  ; row index + 4 for F30F lookup
  tay                    ; $F2B1 A8
  ldx $24                ; $F2B2 A6 24
  jsr $F30F              ; $F2B4 20 0F F3
  ldy $7185              ; $F2B7 AC 85 71
- bne _label_bank3_f2cf		; $F2BA D0 13
- tay                    ; $F2BC A8
+ bne _label_bank3_f2cf		; $F2BA D0 13  ; $7185 already set from row 0: skip to OR
+ tay                    ; $F2BC A8       ; save A (masked attr value)
  lda $6800,X            ; $F2BD BD 00 68
  and $7182              ; $F2C0 2D 82 71
 
+; Normalise the column attribute to a 2-bit nibble (right-shift until < 4).
 _label_bank3_f2c3:
  cmp #$04               ; $F2C3 C9 04
  bcc _label_bank3_f2cb		; $F2C5 90 04
- lsr A          ; $F2C7 4A
- lsr A          ; $F2C8 4A
+ lsr A                  ; $F2C7 4A
+ lsr A                  ; $F2C8 4A
  bne _label_bank3_f2c3		; $F2C9 D0 F8
 
 _label_bank3_f2cb:
- sta $7180              ; $F2CB 8D 80 71
+ sta $7180              ; $F2CB 8D 80 71  ; store row-0 reference value
  tya                    ; $F2CE 98
 
 _label_bank3_f2cf:
+; Accumulate scene-attribute conflict into $7185.
  ora $7185              ; $F2CF 0D 85 71
  sta $7185              ; $F2D2 8D 85 71
+; Now check $6800[X] for the SECOND row against $7182.
  lda $6800,X            ; $F2D5 BD 00 68
  and $7182              ; $F2D8 2D 82 71
 
 _label_bank3_f2db:
  cmp #$04               ; $F2DB C9 04
  bcc _label_bank3_f2e3		; $F2DD 90 04
- lsr A          ; $F2DF 4A
- lsr A          ; $F2E0 4A
+ lsr A                  ; $F2DF 4A
+ lsr A                  ; $F2E0 4A
  bne _label_bank3_f2db		; $F2E1 D0 F8
 
 _label_bank3_f2e3:
+; Compare this column's normalised attribute to the row-0 reference.
+; Mismatch -> carry=1 exit at $F307 (column attribute conflict).
  cmp $7180              ; $F2E3 CD 80 71
- bne _label_bank3_f307		; $F2E6 D0 1F
+ bne _label_bank3_f307		; $F2E6 D0 1F  ; mismatch: carry=1 exit
  inc $24                ; $F2E8 E6 24
  dec $1D                ; $F2EA C6 1D
- bne _label_bank3_f2ac		; $F2EC D0 BE
- pla                    ; $F2EE 68
+ bne _label_bank3_f2ac		; $F2EC D0 BE  ; next column
+ pla                    ; $F2EE 68       ; restore $24
  sta $24                ; $F2EF 85 24
  lda z:_var_pntr_1a1b_lowByte                ; $F2F1 A5 1A
  clc                    ; $F2F3 18
- adc #$40               ; $F2F4 69 40
+ adc #$40               ; $F2F4 69 40   ; advance $1A to next row (+$40 = 64 cols)
  sta z:_var_pntr_1a1b_lowByte                ; $F2F6 85 1A
  bcc _label_bank3_f2fc		; $F2F8 90 02
  inc z:_var_pntr_1a1b_highByte                ; $F2FA E6 1B
 
 _label_bank3_f2fc:
- inc z:_var_pntr_2223_lowByte                ; $F2FC E6 22
+ inc z:_var_pntr_2223_lowByte                ; $F2FC E6 22  ; next row index
  dec $1C                ; $F2FE C6 1C
- bne _label_bank3_f294		; $F300 D0 92
- pla                    ; $F302 68
+ bne _label_bank3_f294		; $F300 D0 92  ; continue outer row loop
+ pla                    ; $F302 68       ; restore original $22
  sta z:_var_pntr_2223_lowByte                ; $F303 85 22
  clc                    ; $F305 18
- rts                    ; $F306 60
+ rts                    ; $F306 60       ; carry=0: position fully valid
 
+; Column attribute mismatch exit.
+; $7185 holds the conflicting column attribute (non-zero), so the caller at
+; F054/F057 will detect $7185 != 0 and retry Y.
+; When this path is taken because ($4B),5 bit7 set (sprite-attr flag): $1A
+; has been advanced to row 1 during the check, so we subtract $40 to undo.
 _label_bank3_f307:
- pla                    ; $F307 68
+ pla                    ; $F307 68       ; restore $24
  sta $24                ; $F308 85 24
 
-; here if placing Waldo failed?
+; carry=1 tile-blocked exit (jumped from $F29C).
+; Restores $22 from stack, sets carry=1, returns.
 _label_bank3_f30a:
  pla                    ; $F30A 68
  sta z:_var_pntr_2223_lowByte                ; $F30B 85 22
  sec                    ; $F30D 38
  rts                    ; $F30E 60
 
+; bank3_f30f ($F30F) -- column-attribute lookup for placement validation.
+; Called from F26A (F2B4 and F84 area) with X = column index ($24), Y = row+4.
+; Computes a combined row+column index $7184 and loads the bitmask $7182
+; for the current row parity.
+;
+; Inputs:  X = column (0-based), Y = row index + 4
+; Outputs: $7184 = F444[X] + F426[Y]  (combined index into $6780 scene-attr table)
+;          $7182 = column attribute mask (from F484[X] or F4C4[X] depending on row parity)
+;          $7183 = ~$7182 (inverse mask)
+;          A     = $6780[$7184] AND $7182  (masked scene-attribute byte for this position)
+;
+; Row parity is detected by testing bit 1 of Y (the row+4 value):
+;   bit1 = 0 (Y AND $02 == 0): use F484[X] as mask  (even rows, including row 0)
+;   bit1 = 1 (Y AND $02 != 0): use F4C4[X] as mask  (odd rows, including row 1)
+; For a 2-row entity (height=2), row 0 uses F484, row 1 uses F4C4.
+; These two tables differ in bit1 of the mask, which is the source of the
+; "deliberate mismatch" exploited by the $7185 sprite-attribute path in F26A:
+; if $6780[$7184] & F484[X] != 0, setting $7185 on row 0 causes F4C4's
+; different mask to produce a different normalised nibble on row 1,
+; triggering the $F2E6 mismatch branch -> carry=1 exit -> retry at F01F.
+;
+; Table addresses:
+;   $F444   : row-stride offsets (indexed by X = column)
+;   $F426   : column offsets (indexed by Y = row+4)
+;   $F484   : even-row attribute masks (indexed by X)
+;   $F4C4   : odd-row attribute masks  (indexed by X, bit1 flipped vs F484)
+;   $6780   : 128-byte scene-attribute table (built at EE80 from tilemap scan)
  lda $F444,X            ; $F30F BD 44 F4
  clc                    ; $F312 18
  adc $F426,Y            ; $F313 79 26 F4
- sta $7184              ; $F316 8D 84 71
+ sta $7184              ; $F316 8D 84 71  ; combined $6780 index
  tya                    ; $F319 98
- and #$02               ; $F31A 29 02
- bne _label_bank3_f324		; $F31C D0 06
- lda $F484,X            ; $F31E BD 84 F4
+ and #$02               ; $F31A 29 02     ; test row parity bit
+ bne _label_bank3_f324		; $F31C D0 06     ; odd row -> use F4C4 mask
+ lda $F484,X            ; $F31E BD 84 F4  ; even row: F484 mask
  jmp $F327              ; $F321 4C 27 F3
 
 _label_bank3_f324:
- lda $F4C4,X            ; $F324 BD C4 F4
+ lda $F4C4,X            ; $F324 BD C4 F4  ; odd row: F4C4 mask (bit1 differs from F484)
  sta $7182              ; $F327 8D 82 71
  eor #$FF               ; $F32A 49 FF
- sta $7183              ; $F32C 8D 83 71
+ sta $7183              ; $F32C 8D 83 71  ; inverse mask
  ldx $7184              ; $F32F AE 84 71
- lda $6780,X            ; $F332 BD 80 67
- and $7182              ; $F335 2D 82 71
- rts                    ; $F338 60
+ lda $6780,X            ; $F332 BD 80 67  ; scene-attribute byte for this position
+ and $7182              ; $F335 2D 82 71  ; mask to relevant bits
+ rts                    ; $F338 60        ; returns masked value in A
 
  lda $F504,Y            ; $F339 B9 04 F5
  and $7182              ; $F33C 2D 82 71
